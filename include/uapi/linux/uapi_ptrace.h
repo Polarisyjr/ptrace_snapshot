@@ -74,6 +74,10 @@ struct seccomp_metadata {
 };
 
 #define PTRACE_GET_SYSCALL_INFO		0x420e
+#define PTRACE_SNAPSHOT           0x420f  // New: Used to create a snapshot of a specified memory region
+#define PTRACE_RESTORE            0x4210  // New: Used to restore a snapshot of a specified memory region
+#define PTRACE_GETSNAPSHOT        0x4211  // New: Used to retrieve snapshot information
+
 #define PTRACE_SYSCALL_INFO_NONE	0
 #define PTRACE_SYSCALL_INFO_ENTRY	1
 #define PTRACE_SYSCALL_INFO_EXIT	2
