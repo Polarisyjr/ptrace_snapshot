@@ -1350,8 +1350,9 @@ int ptrace_snapshot_memory(struct task_struct *tsk, unsigned long addr, unsigned
     if (!valid_writable_memory_region(tsk, addr, len))
     	return -EACCES;
     snapshot = kmalloc(len, GFP_KERNEL);
-    if (!snapshot)
+    if (!snapshot){
     	return -ENOMEM;
+	}
 	ret = ptrace_access_vm(tsk, addr, snapshot, len, FOLL_FORCE);
     if (ret != len) {
         kfree(snapshot);
@@ -1364,13 +1365,14 @@ int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr) {
     struct task_snapshot *ts;
     struct snapshot *snap;
 	int ret;
-    if (!valid_writable_memory_region(tsk, addr, len))
-        return -EACCES;
     ts = find_task_snapshot(tsk);
     if (!ts)
         return -ENOENT;  
     hash_for_each_possible(ts->snapshots, snap, node, addr) {
         if (snap->addr == addr) {
+			if (!valid_writable_memory_region(tsk, addr, snap->len)){
+				return -EACCES;
+			}
             ret = ptrace_access_vm(tsk, addr, snap->data, snap->len, FOLL_FORCE | FOLL_WRITE);
             if (ret != snap->len) {
                 return -EIO; 
@@ -1379,11 +1381,9 @@ int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr) {
             kfree(snap->data);
             hash_del(&snap->node); 
             kfree(snap); 
-
             return 0; 
         }
     }
-
     return -ENOENT; 
 }
 
@@ -1453,12 +1453,12 @@ int store_snapshot(struct task_struct *tsk, unsigned long addr, void *new_snapsh
         }
     }
     if (ts->total_snapshot_size + len > MAX_TOTAL_SNAPSHOT_SIZE) {
-        kfree(snapshot);  
+        kfree(new_snapshot);  
         return -ENOMEM;   
     }
 
 	if (found) {
-        snap->data = snapshot;
+        snap->data = new_snapshot;
         snap->len = len;
     } else{
 		snap = kmalloc(sizeof(struct snapshot), GFP_KERNEL);
@@ -1468,7 +1468,7 @@ int store_snapshot(struct task_struct *tsk, unsigned long addr, void *new_snapsh
 		}
 		snap->addr = addr;
 		snap->len = len;
-		snap->data = snapshot;
+		snap->data = new_snapshot;
 		hash_add(ts->snapshots, &snap->node, addr);
 	}
     ts->total_snapshot_size += len;  
