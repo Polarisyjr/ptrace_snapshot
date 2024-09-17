@@ -1044,6 +1044,16 @@ int ptrace_request(struct task_struct *child, long request,
 	case PTRACE_POKEDATA:
 		return generic_ptrace_pokedata(child, addr, data);
 
+	case PTRACE_SNAPSHOT:
+        //  snapshot a memory region
+       	return ptrace_snapshot_memory(child, addr, data);
+    case PTRACE_RESTORE:
+        // restore the snapshot for a memory region
+        return ptrace_restore_memory(child, addr);
+    case PTRACE_GETSNAPSHOT:
+        // read the snapshot for a memory region
+        return ptrace_get_snapshot(child, addr, datavp);
+
 #ifdef PTRACE_OLDSETOPTIONS
 	case PTRACE_OLDSETOPTIONS:
 #endif
@@ -1330,6 +1340,161 @@ int generic_ptrace_pokedata(struct task_struct *tsk, unsigned long addr,
 	copied = ptrace_access_vm(tsk, addr, &data, sizeof(data),
 			FOLL_FORCE | FOLL_WRITE);
 	return (copied == sizeof(data)) ? 0 : -EIO;
+}
+
+int ptrace_snapshot_memory(struct task_struct *tsk, unsigned long addr, unsigned long len) {
+	if (addr == 0 || len == 0 || len > MAX_SNAPSHOT_LEN)
+        return -EINVAL;
+    if (!valid_writable_memory_region(tsk, addr, len))
+        return -EACCES;
+    void *snapshot = kmalloc(len, GFP_KERNEL);
+    if (!snapshot)
+        return -ENOMEM;
+	int ret = ptrace_access_vm(tsk, addr, snapshot, len, FOLL_FORCE);
+    if (ret != len) {
+        kfree(snapshot);
+        return -EIO;
+    }
+    return store_snapshot(tsk, addr, snapshot, len);
+}
+
+int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr, unsigned long len) {
+    struct task_snapshot *ts;
+    struct snapshot *snap;
+    if (!valid_writable_memory_region(tsk, addr, len))
+        return -EACCES;
+    ts = find_task_snapshot(tsk);
+    if (!ts)
+        return -ENOENT;  
+    hash_for_each_possible(ts->snapshots, snap, node, addr) {
+        if (snap->addr == addr) {
+            int ret = ptrace_access_vm(tsk, addr, snap->data, snap->len, FOLL_FORCE | FOLL_WRITE);
+            if (ret != snap->len) {
+                return -EIO; 
+            }
+            ts->total_snapshot_size -= snap->len;
+            kfree(snap->data);
+            hash_del(&snap->node); 
+            kfree(snap); 
+
+            return 0; 
+        }
+    }
+
+    return -ENOENT; 
+}
+
+int ptrace_get_snapshot(struct task_struct *tsk, unsigned long addr, unsigned long len, void __user *user_buf){
+	struct task_snapshot *ts;
+    struct snapshot *snap;
+    ts = find_task_snapshot(tsk);
+    if (!ts)
+        return -ENOENT;  
+    hash_for_each_possible(ts->snapshots, snap, node, addr) {
+        if (snap->addr == addr) {
+            if (!access_ok(user_buf, snap->len))
+                return -EFAULT;  
+            if (copy_to_user(user_buf, snap->data, snap->len))
+                return -EFAULT; 
+            return 0;  
+        }
+    }
+    return -ENOENT;  
+}
+
+int valid_writable_memory_region(struct task_struct *tsk, unsigned long addr, unsigned long len) {
+    struct mm_struct *mm;
+    struct vm_area_struct *vma;
+    mm = get_task_mm(tsk);
+    if (!mm)
+        return 0;  
+    if (addr >= TASK_SIZE || addr + len > TASK_SIZE || addr + len < addr) {
+        mmput(mm);
+        return 0;
+    }
+    vma = find_vma(mm, addr);
+    if (!vma || vma->vm_start > addr) {
+        mmput(mm); 
+        return 0;
+    }
+    if (!(vma->vm_flags & VM_WRITE) || vma->vm_end < addr + len) {
+        mmput(mm); 
+        return 0;
+    }
+    mmput(mm); 
+    return 1;
+}
+
+int store_snapshot(struct task_struct *tsk, unsigned long addr, void *new_snapshot, unsigned long len) {
+    struct task_snapshot *ts;
+    struct snapshot *snap; 
+	bool found = false;
+    ts = find_task_snapshot(tsk);
+    if (!ts) { 
+        ts = kmalloc(sizeof(struct task_snapshot), GFP_KERNEL);
+        if (!ts) {
+            kfree(new_snapshot);  
+            return -ENOMEM;
+        }
+        ts->task = tsk;
+        ts->total_snapshot_size = 0;
+        hash_init(ts->snapshots);  
+        hash_add(snapshot_table, &ts->node, (unsigned long)tsk); 
+    }
+    hash_for_each_possible(ts->snapshots, snap, node, addr) {
+        if (snap->addr == addr) {
+            ts->total_snapshot_size -= snap->len;
+            kfree(snap->data);
+			found = true;
+            break;
+        }
+    }
+    if (ts->total_snapshot_size + len > MAX_TOTAL_SNAPSHOT_SIZE) {
+        kfree(snapshot);  
+        return -ENOMEM;   
+    }
+
+	if (found) {
+        snap->data = snapshot;
+        snap->len = len;
+    } else{
+		snap = kmalloc(sizeof(struct snapshot), GFP_KERNEL);
+		if (!snap) {
+			kfree(new_snapshot);  
+			return -ENOMEM;
+		}
+		snap->addr = addr;
+		snap->len = len;
+		snap->data = snapshot;
+		hash_add(ts->snapshots, &snap->node, addr);
+	}
+    ts->total_snapshot_size += len;  
+    return 0;
+}
+
+struct task_snapshot *find_task_snapshot(struct task_struct *tsk) {
+    struct task_snapshot *ts;
+    hash_for_each_possible(snapshot_table, ts, node, (unsigned long)tsk) {
+        if (ts->task == tsk)
+            return ts;
+    }
+    return NULL;  
+}
+
+void cleanup_task_snapshots(struct task_struct *tsk) {
+    struct task_snapshot *ts;
+    struct snapshot *snap;
+    int bkt;
+    ts = find_task_snapshot(tsk);
+    if (ts) {
+        hash_for_each(ts->snapshots, bkt, snap, node) {
+            kfree(snap->data);  
+			hash_del(&snap->node);
+            kfree(snap);        
+        }
+        hash_del(&ts->node);
+        kfree(ts);
+    }
 }
 
 #if defined CONFIG_COMPAT

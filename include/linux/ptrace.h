@@ -11,6 +11,8 @@
 #include <uapi/linux/ptrace.h>
 #include <linux/seccomp.h>
 
+#include <linux/hashtable.h>
+#include <linux/slab.h>  
 /* Add sp to seccomp_data, as seccomp is user API, we don't want to modify it */
 struct syscall_info {
 	__u64			sp;
@@ -70,6 +72,32 @@ extern void exit_ptrace(struct task_struct *tracer, struct list_head *dead);
 #define PTRACE_MODE_READ_REALCREDS (PTRACE_MODE_READ | PTRACE_MODE_REALCREDS)
 #define PTRACE_MODE_ATTACH_FSCREDS (PTRACE_MODE_ATTACH | PTRACE_MODE_FSCREDS)
 #define PTRACE_MODE_ATTACH_REALCREDS (PTRACE_MODE_ATTACH | PTRACE_MODE_REALCREDS)
+
+#define MAX_SNAPSHOT_LEN 		262144
+#define MAX_TOTAL_SNAPSHOT_SIZE 512
+struct snapshot {
+    unsigned long addr;  
+    unsigned long len;   
+    void *data;          
+    struct hlist_node node; 
+};
+
+struct task_snapshot {
+    struct task_struct *task; 
+    unsigned long total_snapshot_size;  
+    DECLARE_HASHTABLE(snapshots, 8);  
+	struct hlist_node node; 
+};
+
+DECLARE_HASHTABLE(snapshot_table, 10);
+
+int valid_writable_memory_region(struct task_struct *tsk, unsigned long addr, unsigned long len)
+struct task_snapshot *find_task_snapshot(struct task_struct *tsk);
+int store_snapshot(struct task_struct *tsk, unsigned long addr, void *snapshot, unsigned long len);
+void cleanup_task_snapshots(struct task_struct *tsk);
+int ptrace_snapshot_memory(struct task_struct *tsk, unsigned long addr, unsigned long len);
+int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr);
+int ptrace_get_snapshot(struct task_struct *tsk, unsigned long addr, void __user *user_buf);
 
 /**
  * ptrace_may_access - check whether the caller is permitted to access
@@ -228,6 +256,7 @@ static inline void ptrace_init_task(struct task_struct *child, bool ptrace)
 static inline void ptrace_release_task(struct task_struct *task)
 {
 	BUG_ON(!list_empty(&task->ptraced));
+	cleanup_task_snapshots(task);
 	ptrace_unlink(task);
 	BUG_ON(!list_empty(&task->ptrace_entry));
 }
