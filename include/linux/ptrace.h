@@ -91,7 +91,7 @@ struct task_snapshot {
 
 DECLARE_HASHTABLE(snapshot_table, 10);
 
-int valid_writable_memory_region(struct task_struct *tsk, unsigned long addr, unsigned long len)
+int valid_writable_memory_region(struct task_struct *tsk, unsigned long addr, unsigned long len);
 struct task_snapshot *find_task_snapshot(struct task_struct *tsk);
 int store_snapshot(struct task_struct *tsk, unsigned long addr, void *snapshot, unsigned long len);
 void cleanup_task_snapshots(struct task_struct *tsk);
