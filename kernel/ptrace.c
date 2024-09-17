@@ -34,6 +34,7 @@
 
 #include <asm/syscall.h>	/* for syscall_get_* */
 
+DECLARE_HASHTABLE(snapshot_table, 10);
 /*
  * Access another process' address space via ptrace.
  * Source/target buffer must be kernel space,
