@@ -1343,14 +1343,16 @@ int generic_ptrace_pokedata(struct task_struct *tsk, unsigned long addr,
 }
 
 int ptrace_snapshot_memory(struct task_struct *tsk, unsigned long addr, unsigned long len) {
+	void *snapshot;
+	int ret;
 	if (addr == 0 || len == 0 || len > MAX_SNAPSHOT_LEN)
-        return -EINVAL;
+    	return -EINVAL;
     if (!valid_writable_memory_region(tsk, addr, len))
-        return -EACCES;
-    void *snapshot = kmalloc(len, GFP_KERNEL);
+    	return -EACCES;
+    snapshot = kmalloc(len, GFP_KERNEL);
     if (!snapshot)
-        return -ENOMEM;
-	int ret = ptrace_access_vm(tsk, addr, snapshot, len, FOLL_FORCE);
+    	return -ENOMEM;
+	ret = ptrace_access_vm(tsk, addr, snapshot, len, FOLL_FORCE);
     if (ret != len) {
         kfree(snapshot);
         return -EIO;
@@ -1358,9 +1360,10 @@ int ptrace_snapshot_memory(struct task_struct *tsk, unsigned long addr, unsigned
     return store_snapshot(tsk, addr, snapshot, len);
 }
 
-int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr, unsigned long len) {
+int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr) {
     struct task_snapshot *ts;
     struct snapshot *snap;
+	int ret;
     if (!valid_writable_memory_region(tsk, addr, len))
         return -EACCES;
     ts = find_task_snapshot(tsk);
@@ -1368,7 +1371,7 @@ int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr, unsigned 
         return -ENOENT;  
     hash_for_each_possible(ts->snapshots, snap, node, addr) {
         if (snap->addr == addr) {
-            int ret = ptrace_access_vm(tsk, addr, snap->data, snap->len, FOLL_FORCE | FOLL_WRITE);
+            ret = ptrace_access_vm(tsk, addr, snap->data, snap->len, FOLL_FORCE | FOLL_WRITE);
             if (ret != snap->len) {
                 return -EIO; 
             }
@@ -1384,7 +1387,7 @@ int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr, unsigned 
     return -ENOENT; 
 }
 
-int ptrace_get_snapshot(struct task_struct *tsk, unsigned long addr, unsigned long len, void __user *user_buf){
+int ptrace_get_snapshot(struct task_struct *tsk, unsigned long addr, void __user *user_buf){
 	struct task_snapshot *ts;
     struct snapshot *snap;
     ts = find_task_snapshot(tsk);
