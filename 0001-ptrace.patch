@@ -1,0 +1,275 @@
+From fa4494e5a0ab89020ad2c37a30d5d154123922c9 Mon Sep 17 00:00:00 2001
+From: Polarisyjr <yjrcs@umich.edu>
+Date: Thu, 19 Sep 2024 10:57:20 +0800
+Subject: [PATCH] ptrace
+
+---
+ include/linux/ptrace.h      |  27 ++++++
+ include/uapi/linux/ptrace.h |   4 +
+ kernel/ptrace.c             | 169 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 200 insertions(+)
+
+diff --git a/include/linux/ptrace.h b/include/linux/ptrace.h
+index ae7dbdfa3..9740548b3 100644
+--- a/include/linux/ptrace.h
++++ b/include/linux/ptrace.h
+@@ -11,6 +11,8 @@
+ #include <uapi/linux/ptrace.h>
+ #include <linux/seccomp.h>
+ 
++#include <linux/hashtable.h>
++#include <linux/slab.h>  
+ /* Add sp to seccomp_data, as seccomp is user API, we don't want to modify it */
+ struct syscall_info {
+ 	__u64			sp;
+@@ -71,6 +73,30 @@ extern void exit_ptrace(struct task_struct *tracer, struct list_head *dead);
+ #define PTRACE_MODE_ATTACH_FSCREDS (PTRACE_MODE_ATTACH | PTRACE_MODE_FSCREDS)
+ #define PTRACE_MODE_ATTACH_REALCREDS (PTRACE_MODE_ATTACH | PTRACE_MODE_REALCREDS)
+ 
++#define MAX_SNAPSHOT_LEN 		262144
++#define MAX_TOTAL_SNAPSHOT_SIZE 512
++struct snapshot {
++    unsigned long addr;  
++    unsigned long len;   
++    void *data;          
++    struct hlist_node node; 
++};
++
++struct task_snapshot {
++    struct task_struct *task; 
++    unsigned long total_snapshot_size;  
++    DECLARE_HASHTABLE(snapshots, 8);  
++	struct hlist_node node; 
++};
++
++int valid_writable_memory_region(struct task_struct *tsk, unsigned long addr, unsigned long len);
++struct task_snapshot *find_task_snapshot(struct task_struct *tsk);
++int store_snapshot(struct task_struct *tsk, unsigned long addr, void *snapshot, unsigned long len);
++void cleanup_task_snapshots(struct task_struct *tsk);
++int ptrace_snapshot_memory(struct task_struct *tsk, unsigned long addr, unsigned long len);
++int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr);
++int ptrace_get_snapshot(struct task_struct *tsk, unsigned long addr, void __user *user_buf);
++
+ /**
+  * ptrace_may_access - check whether the caller is permitted to access
+  * a target task.
+@@ -228,6 +254,7 @@ static inline void ptrace_init_task(struct task_struct *child, bool ptrace)
+ static inline void ptrace_release_task(struct task_struct *task)
+ {
+ 	BUG_ON(!list_empty(&task->ptraced));
++	cleanup_task_snapshots(task);
+ 	ptrace_unlink(task);
+ 	BUG_ON(!list_empty(&task->ptrace_entry));
+ }
+diff --git a/include/uapi/linux/ptrace.h b/include/uapi/linux/ptrace.h
+index 83ee45fa6..3fa46f989 100644
+--- a/include/uapi/linux/ptrace.h
++++ b/include/uapi/linux/ptrace.h
+@@ -74,6 +74,10 @@ struct seccomp_metadata {
+ };
+ 
+ #define PTRACE_GET_SYSCALL_INFO		0x420e
++#define PTRACE_SNAPSHOT           0x420f  // New: Used to create a snapshot of a specified memory region
++#define PTRACE_RESTORE            0x4210  // New: Used to restore a snapshot of a specified memory region
++#define PTRACE_GETSNAPSHOT        0x4211  // New: Used to retrieve snapshot information
++
+ #define PTRACE_SYSCALL_INFO_NONE	0
+ #define PTRACE_SYSCALL_INFO_ENTRY	1
+ #define PTRACE_SYSCALL_INFO_EXIT	2
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index aab480e24..a770d50e6 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -34,6 +34,7 @@
+ 
+ #include <asm/syscall.h>	/* for syscall_get_* */
+ 
++DECLARE_HASHTABLE(snapshot_table, 10);
+ /*
+  * Access another process' address space via ptrace.
+  * Source/target buffer must be kernel space,
+@@ -1044,6 +1045,16 @@ int ptrace_request(struct task_struct *child, long request,
+ 	case PTRACE_POKEDATA:
+ 		return generic_ptrace_pokedata(child, addr, data);
+ 
++	case PTRACE_SNAPSHOT:
++        //  snapshot a memory region
++       	return ptrace_snapshot_memory(child, addr, data);
++    case PTRACE_RESTORE:
++        // restore the snapshot for a memory region
++        return ptrace_restore_memory(child, addr);
++    case PTRACE_GETSNAPSHOT:
++        // read the snapshot for a memory region
++        return ptrace_get_snapshot(child, addr, datavp);
++
+ #ifdef PTRACE_OLDSETOPTIONS
+ 	case PTRACE_OLDSETOPTIONS:
+ #endif
+@@ -1332,6 +1343,164 @@ int generic_ptrace_pokedata(struct task_struct *tsk, unsigned long addr,
+ 	return (copied == sizeof(data)) ? 0 : -EIO;
+ }
+ 
++int ptrace_snapshot_memory(struct task_struct *tsk, unsigned long addr, unsigned long len) {
++	void *snapshot;
++	int ret;
++	if (addr == 0 || len == 0 || len > MAX_SNAPSHOT_LEN)
++    	return -EINVAL;
++    if (!valid_writable_memory_region(tsk, addr, len))
++    	return -EACCES;
++    snapshot = kmalloc(len, GFP_KERNEL);
++    if (!snapshot){
++    	return -ENOMEM;
++	}
++	ret = ptrace_access_vm(tsk, addr, snapshot, len, FOLL_FORCE);
++    if (ret != len) {
++        kfree(snapshot);
++        return -EIO;
++    }
++    return store_snapshot(tsk, addr, snapshot, len);
++}
++
++int ptrace_restore_memory(struct task_struct *tsk, unsigned long addr) {
++    struct task_snapshot *ts;
++    struct snapshot *snap;
++	int ret;
++    ts = find_task_snapshot(tsk);
++    if (!ts)
++        return -ENOENT;  
++    hash_for_each_possible(ts->snapshots, snap, node, addr) {
++        if (snap->addr == addr) {
++			if (!valid_writable_memory_region(tsk, addr, snap->len)){
++				return -EACCES;
++			}
++            ret = ptrace_access_vm(tsk, addr, snap->data, snap->len, FOLL_FORCE | FOLL_WRITE);
++            if (ret != snap->len) {
++                return -EIO; 
++            }
++            ts->total_snapshot_size -= snap->len;
++            kfree(snap->data);
++            hash_del(&snap->node); 
++            kfree(snap); 
++            return 0; 
++        }
++    }
++    return -ENOENT; 
++}
++
++int ptrace_get_snapshot(struct task_struct *tsk, unsigned long addr, void __user *user_buf){
++	struct task_snapshot *ts;
++    struct snapshot *snap;
++    ts = find_task_snapshot(tsk);
++    if (!ts)
++        return -ENOENT;  
++    hash_for_each_possible(ts->snapshots, snap, node, addr) {
++        if (snap->addr == addr) {
++            if (!access_ok(user_buf, snap->len))
++                return -EFAULT;  
++            if (copy_to_user(user_buf, snap->data, snap->len))
++                return -EFAULT; 
++            return 0;  
++        }
++    }
++    return -ENOENT;  
++}
++
++int valid_writable_memory_region(struct task_struct *tsk, unsigned long addr, unsigned long len) {
++    struct mm_struct *mm;
++    struct vm_area_struct *vma;
++    mm = get_task_mm(tsk);
++    if (!mm)
++        return 0;  
++    if (addr >= TASK_SIZE || addr + len > TASK_SIZE || addr + len < addr) {
++        mmput(mm);
++        return 0;
++    }
++    vma = find_vma(mm, addr);
++    if (!vma || vma->vm_start > addr) {
++        mmput(mm); 
++        return 0;
++    }
++    if (!(vma->vm_flags & VM_WRITE) || vma->vm_end < addr + len) {
++        mmput(mm); 
++        return 0;
++    }
++    mmput(mm); 
++    return 1;
++}
++
++int store_snapshot(struct task_struct *tsk, unsigned long addr, void *new_snapshot, unsigned long len) {
++    struct task_snapshot *ts;
++    struct snapshot *snap; 
++	bool found = false;
++    ts = find_task_snapshot(tsk);
++    if (!ts) { 
++        ts = kmalloc(sizeof(struct task_snapshot), GFP_KERNEL);
++        if (!ts) {
++            kfree(new_snapshot);  
++            return -ENOMEM;
++        }
++        ts->task = tsk;
++        ts->total_snapshot_size = 0;
++        hash_init(ts->snapshots);  
++        hash_add(snapshot_table, &ts->node, (unsigned long)tsk); 
++    }
++    hash_for_each_possible(ts->snapshots, snap, node, addr) {
++        if (snap->addr == addr) {
++            ts->total_snapshot_size -= snap->len;
++            kfree(snap->data);
++			found = true;
++            break;
++        }
++    }
++    if (ts->total_snapshot_size + len > MAX_TOTAL_SNAPSHOT_SIZE) {
++        kfree(new_snapshot);  
++        return -ENOMEM;   
++    }
++
++	if (found) {
++        snap->data = new_snapshot;
++        snap->len = len;
++    } else{
++		snap = kmalloc(sizeof(struct snapshot), GFP_KERNEL);
++		if (!snap) {
++			kfree(new_snapshot);  
++			return -ENOMEM;
++		}
++		snap->addr = addr;
++		snap->len = len;
++		snap->data = new_snapshot;
++		hash_add(ts->snapshots, &snap->node, addr);
++	}
++    ts->total_snapshot_size += len;  
++    return 0;
++}
++
++struct task_snapshot *find_task_snapshot(struct task_struct *tsk) {
++    struct task_snapshot *ts;
++    hash_for_each_possible(snapshot_table, ts, node, (unsigned long)tsk) {
++        if (ts->task == tsk)
++            return ts;
++    }
++    return NULL;  
++}
++
++void cleanup_task_snapshots(struct task_struct *tsk) {
++    struct task_snapshot *ts;
++    struct snapshot *snap;
++    int bkt;
++    ts = find_task_snapshot(tsk);
++    if (ts) {
++        hash_for_each(ts->snapshots, bkt, snap, node) {
++            kfree(snap->data);  
++			hash_del(&snap->node);
++            kfree(snap);        
++        }
++        hash_del(&ts->node);
++        kfree(ts);
++    }
++}
++
+ #if defined CONFIG_COMPAT
+ 
+ int compat_ptrace_request(struct task_struct *child, compat_long_t request,
+-- 
+2.34.1
+
