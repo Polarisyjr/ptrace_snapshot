@@ -6,98 +6,106 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <errno.h>
 
-#define SNAPSHOT_X 0x420F   // PTRACE_SNAPSHOT
+#define SNAPSHOT_X 0x420f   // PTRACE_SNAPSHOT
 #define RESTORE_X  0x4210   // PTRACE_RESTORE
 
-void tracer(pid_t tracee) {
-    // 等待 tracee 停止
+void tracer(pid_t tracee, char *region) {
+    // wait for tracee
     waitpid(tracee, NULL, 0);
 
-    // 执行第一次快照
-    printf("Taking snapshot X (before v1)...\n");
-    if (ptrace(SNAPSHOT_X, tracee, 0x0, 0x1000) == -1) {
+    // let tracee continue to write "v1"
+    ptrace(PTRACE_CONT, tracee, 0, 0);
+    waitpid(tracee, NULL, 0);
+
+    // take the first snapshot
+    printf("Taking snapshot X (after v1)...\n");
+    if (ptrace(SNAPSHOT_X, tracee, region, 0x100) == -1) {
         perror("ptrace snapshot X failed");
         exit(EXIT_FAILURE);
     }
 
-    // 继续 tracee 以写入 v1
+    // let the tracee continue writing "v2"
     ptrace(PTRACE_CONT, tracee, 0, 0);
     waitpid(tracee, NULL, 0);
 
-    // 执行第二次快照
-    printf("Taking snapshot X again (before v2)...\n");
-    if (ptrace(SNAPSHOT_X, tracee, 0x0, 0x1000) == -1) {
+    // take the second snapshot, and the snapshot should now be overwritten with "v2"
+    printf("Taking snapshot X again (after v2)...\n");
+    if (ptrace(SNAPSHOT_X, tracee, region, 0x100) == -1) {
         perror("ptrace snapshot X failed");
         exit(EXIT_FAILURE);
     }
 
-    // 继续 tracee 以写入 bad 数据
+    // let tracee continue to write "bad data"
     ptrace(PTRACE_CONT, tracee, 0, 0);
     waitpid(tracee, NULL, 0);
 
-    // 恢复之前的快照
-    printf("Restoring snapshot X...\n");
-    if (ptrace(RESTORE_X, tracee, 0x0, 0) == -1) {
+    // restore the snapshot
+    printf("Restoring snapshot X (restoring v2)...\n");
+    if (ptrace(RESTORE_X, tracee, region, 0x100) == -1) {
         perror("ptrace restore X failed");
         exit(EXIT_FAILURE);
     }
 
-    // 继续 tracee 以读取数据
+    // let tracee read the data from snapshot
     ptrace(PTRACE_CONT, tracee, 0, 0);
     waitpid(tracee, NULL, 0);
 
     ptrace(PTRACE_DETACH, tracee, 0, 0);
 }
 
-void tracee() {
-    char *region = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (region == MAP_FAILED) {
-        perror("mmap failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // 停止自己，等待 tracer 操作
+void tracee(char *region) {
+    // stop itself，wait for tracer
     if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) {
         perror("ptrace traceme failed");
         exit(EXIT_FAILURE);
     }
 
-    raise(SIGSTOP);  // 让 tracer 开始跟踪
+    raise(SIGSTOP);  // tracer start to trace
 
-    // 写入 v1 到内存区域
+    // write v1 into region mem
     strcpy(region, "v1");
-    printf("Tracee wrote v1 to memory\n");
+    printf("Tracee wrote v1 to memory: %s\n", region);
 
-    // 停止自己，让 tracer 执行快照
+    // stop itself，let tracer execute the first snapshot
     raise(SIGSTOP);
 
-    // 写入 v2 到内存区域
+    // write v2 into region mem
     strcpy(region, "v2");
-    printf("Tracee wrote v2 to memory\n");
+    printf("Tracee wrote v2 to memory: %s\n", region);
 
-    // 停止自己，让 tracer 执行快照
+    // stop itself，let tracer execute the second snapshot
     raise(SIGSTOP);
 
-    // 写入 bad 数据到内存区域
+    // write baddata into region mem
     strcpy(region, "bad data");
-    printf("Tracee wrote bad data to memory\n");
+    printf("Tracee wrote bad data to memory: %s\n", region);
 
-    // 停止自己，让 tracer 执行恢复操作
+    // stop itself，let tracer execute the store operation
     raise(SIGSTOP);
 
-    // 读取内存数据，检查是否已经恢复
+    // read the memory data and check if it has been restored
     printf("Tracee reads memory: %s\n", region);
 
     exit(EXIT_SUCCESS);
 }
 
 int main() {
+    // shared memory
+    char *region = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) {
+        perror("mmap failed");
+        exit(EXIT_FAILURE);
+    }
+
     pid_t pid = fork();
     if (pid == 0) {
-        tracee();
+        tracee(region);
     } else {
-        tracer(pid);
+        sleep(1);  // Ensure the tracee runs first
+        tracer(pid, region);
     }
+
     return 0;
 }
